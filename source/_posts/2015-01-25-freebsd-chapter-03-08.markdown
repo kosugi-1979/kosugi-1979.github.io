@@ -1,0 +1,100 @@
+---
+layout: post
+title: "The Design and Implementation of the FreeBSD Operating System Second Edition Chapter 3.8"
+date: 2015-01-25 10:41:29 +0900
+comments: true
+categories: book freebsd
+---
+Kernel Tracing Facilities
+
+- System-Call Tracing
+    - **ktrace**
+        - アプリケーションの全システムコールの詳細なトレースを得られる
+            - 順序
+            - 引数
+            - 結果
+            - pathname
+            - シグナルのタイミング入出力の内容
+        - アプリケーションのソースがなくても使用可能
+        - アプリケーションの実行開始時でも既に実行中でも使用可能
+        - 単一のプロセス、プロセスグループ、現在、将来の全子プロセスに適用可
+        - トレースはバイナリ形式
+            - **kdump** を使って人間が読める形にする
+        - SystemV や Solaris の **truss** でも似たようなことはできるが
+            - **ktrace** よりも大きなオーバーヘッド
+            - 少ない情報しか得られない
+- DTrace
+    - **ktrace** の制限
+        - カーネル内の決まったフックでのみ情報を収集
+        - システムコールに関する情報しか集めない
+    - DTrace は上記の問題に対応するため作られた
+        - FreeBSD10 から default で使用可能
+        - tracepoint というフック
+            - 条件的に情報の収集、表示
+                - D 言語で集めたい情報を記述
+                    - tracepoint の指定と出力する情報の検査、refine
+                        - リファレンスカウントの最大値を出力とか
+                        - リソースの参照回数を出力とか
+            - 実際に使用する tracepoint のみ activate される
+                - 低オーバーヘッド
+            - standard な tracepoint のセットは何もしないでも使える
+                - ライブラリ、カーネル、アプリケーション内の全関数
+                - デベロッパによって加えられたアプリケーション固有のフックもある
+    - DTrace 内のトレースは probes と provider を使って実装
+        - probe はカーネル内の特定の tracepoint
+            - 関数の境界とか
+        - provider は probe の集合をサポートするカーネルモジュール
+    - probe が activate されると DTrace は実行形式にパッチすることで trace 可能にする
+        - deactivate されると元の命令に戻す
+        - 実行中の命令列にパッチするのはセキュリティやプライバシーを侵害する
+            - カーネル probe を enable するには superuser 権限が必要
+    - カーネルのビルド過程で **ctfconvert** プログラムが object に対して実行される
+        - DTrace によって理解可能な object になる
+        - **ctfconvert** はデバッグセクションから情報を得て .SUNW_ctf という新しいセクションを作る
+            - 関数の引数の型情報を含む
+                - 関数境界の provider が利用
+    - DTrace の provider
+        - dtrace\_register() で登録
+            - DTrace が利用可能な provider を追跡して D 言語を通してユーザに見えるようにする
+            - *dtrace\_pops* 構造体を引数として provider に渡す
+        - provider の operation は enabling、disabling、suspending、resuming
+            - probe 内から引数の名前、値を検索するのも provider の operation
+    - fbt モジュールがロードされるとカーネルのリンカ関数を用いて tracepoints を生成
+        - *fbt\_provide\_module\_function()*
+            - カーネルとロードされたモジュール内の関数の entry と exit points を disassemble
+            - *fbt\_probe\_t* のリスト構築
+                - probe され得る関数のアドレス
+                - *fbtp\_patchpoint*: 置き換え対象となる命令のアドレス
+                - *fbtp\_savedval*: tracing の間置き換えられる命令
+                - *fbtp\_patchval*: tracing の間置き換える命令
+        - DTrace が tracepoint を有効にすると
+            - *fbtp\_patchpoint* は *fbtp\_patchval* の命令にセット
+        - DTrace が tracepoint を無効にすると
+            - *fbtp\_patchpoint* は *fbtp\_savedval* の命令に戻す
+    - Dtrace は関数の境界に関連しない tracepoint も付加できる
+        - lockstat provider なんかはカーネルのソースに手で入れた DTrace provider の一例
+            - 個々の thread に対する lock の統計の集収用マクロにピギーパックで実装
+            - lockstat lock profiling がカーネルに組み込まれた時にのみ使用可
+- Kernel Tracing
+    - KTR(kernel tracing facility)
+        - logging
+        - コンパイル時のオプションでカーネルに組み込む
+        - カーネル自身のデバッグ用
+        - trace event は *ktr\_entry* 構造体を用いて記述
+            - timestamp
+            - event が起こった CPU
+            - file とソースの行
+            - プログラマが指定した記述
+            - event を実行した thread
+            - paremeter(6つまで)
+        - kernel tracing system の呼出しは **CTR[0-6]** マクロを使用
+        - KTR のサポートをカーネルに組み込むと固定サイズの配列が用意される
+            - サイズが小さいと event がたくさんあった時に上書きされるかもしれないので注意
+        - event ごとに event mask を付ける
+            - グループとして on/off できるように event mask は関連する event を集約
+            - boot 時には event mask はクリアされていて何も記録されない
+                - *sysctl* の *debug.ktr.mask* か
+                - /boot/loader.conf を使ってセット
+            - kernel tracing event はカーネル内の thread が非同期的にファイルへ書き出す
+                - 出力先は *sysctl* で指定
+                - ファイルへの書き出しは負荷がかかるのでタイミング関連の問題に対しては適さないかも

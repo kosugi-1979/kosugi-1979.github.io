@@ -1,0 +1,66 @@
+---
+layout: post
+title: "Advanced Programming in the UNIX Environment Third Edition"
+date: 2015-04-29 22:20:33 +0900
+comments: true
+categories: book UNIX
+---
+読む前からくじけそうになる程の厚さと重さを誇る。2nd Edition も持っているのだけれど、いい具合に内容が頭から抜けていたので、せっかくだから 3rd Edition の電子書籍版を購入した。
+
+POSIX, SUS(Single UNIX Specification), XSI(X/Open System Interface) といった標準に基いた UNIX プログラミングの非常に有名な本で、UNIX 環境でのプログラミングを知ろうと思った時に最初に参照すべき本。UNIX プログラミングをする人でこの本を知らない人はおそらくいないはず。なので細かい内容に関してここでは触れない。
+
+ちまちま読んでいるうちに気が付いたら日本語版も出ていたようだが、そちらは未読なので翻訳の質などは分からない。ただ、原著の英語は極めて読みやすく、高校卒業程度の英語力があれば日本語で読む必要性は全く感じない。というより、このレベルの英語ですら敬遠するようでは UNIX 環境でのプログラミングはやめておいた方が良い。なお、その読みやすさ故に大事な所を軽く流してしまうことには注意。
+
+2nd Edition からの大きな変更は最新の標準に準拠したことで STREAMS に関する記述が削除されている点。なので、2nd Edition を読んだ人はわざわざ時間をかけて 3rd Edition を読まなくても特に問題はないはず。ちなみに 2nd Edition と 3rd Edition の目次を比べてみると、
+
+| 2nd Edition | 3rd Edition | 
+|-----------|---------------| 
+| 2.9 Conflicts Between Standards | 2.9 Differences Between Standards | 
+| 3.3 *open* Function | 3.3 *open* and *openat* Functions |
+| 4.2 *stat*, *fstat*, and *lstat* Functions | 4.2 *stat*, *fstat*, *fstatat*, and *lstat* Functions | 
+| 4.7 *access* Function | 4.7 *access* and *faccessat* Functions |
+| 4.9 *chmod* and *fchmod* Functions | 4.9 *chmod*, *fchmod* , and *fchmodat* Functions |
+| 4.11 *chwon*, *fchown*, and *lchown* Functions | 4.11 *chwon*, *fchown*, *fchownat* and *lchown* Functions |
+| 4.15 *link*, *unlink*, *remove*, and *rename* Functions | 4.15 *link*, *linkat*, *unlink*, *unlinkat*, and *remove* Functions | 
+| - | 4.16 *rename* and *renameat* Functions |
+| 4.17 *symlink*, *readlink* Functions | 4.18 Creating and Reading Symbolic Links |
+| 4.19 *utime* Function | 4.20 *futimens*, *utimensat*, and *utimes* Functions |
+| 4.20 *mkdir* and *rmdir* Functions | 4.21 *mkdkr*, *mkdirat*, and *rmdir* Functions |
+| - | 5.14 Memory Streams |
+| - | 8.16 Process Scheduling | 
+| 10.19 *sleep* Function | 10.19 *sleep*, *nanosleep*, and *clock_nanosleep* Functions |
+| - | 10.20 *sigqueue* Function |
+| 10.21 Additional Features | - | 
+| - | 10.22 Signal Names and Numbers |
+| - | 11.6.1 Mutexes | 
+| - | 11.6.2 Deadlock Aboidance | 
+| - | 11.6.3 *pthread_mutex_timedlock* Function | 
+| - | 11.6.4 Reader-Writer Locks | 
+| - | 11.6.5 Reader-Writer Locking with Timeouts | 
+| - | 11.6.6 Condition Variables |
+| - | 11.6.7 Spin Locks |
+| - | 11.6.8 Barriers | 
+| - | 12.4.1 Mutex Attributes |
+| - | 12.4.2 Reader-Writer Lock Attributes |
+| - | 12.4.3 Condition Variable Attributes |
+| - | 12.4.4 Barrier Attributes | 
+| 14.4 STREAMS | - |
+| - | 14.5.3 POSIX Asynchronous I/O |
+| - | 15.10 POSIX Semaphores |
+| 17.2 STREAMS-Based Pipes | - |
+| 17.2.1 Naming STREAMS Pipes | - |
+| 17.2.2 Unique Connections | - |
+| 17.3.2 Unique Connections | 17.3 Unique Connections |
+| 17.4.1 Passing File Descriptors over STREAM-Based Pipes | - | 
+| 17.4.2 Passing File Descriptors over UNIX Domain Sockets | - |
+| 19.3.1 STREAMS-Based Pseudo Terminals | - |
+| 19.3.2 BSD-Based Pseudo Terminals | - |
+| 19.3.3 Linux-Based Pseudo Terminals | - |
+
+となっている。一見違いが多そうだが、関数の追加や、STREAMS の記述削除に伴う小項目の整理などが大半なので、実際はそんなに変わっていない。
+
+最初にも書いたが、あまりにも文量が多いので、先頭から読んでいくと途中でくじける確率はかなり高いと思う。章ごとの独立性は高く他の章を参照する必要がある所にはちゃんとリンクがあるので興味のある所だけをつまみ食いする形で読むのが一番正しい読み方な気がする。2 章からいきなり UNIX 環境上でポータブルなプログラムを書くための内容だから、最近良く見かける Linux で動けばそれで良いと考えている人には不要だろう。そういう人はこの本を読まないかもしれないが。
+
+本書で例として掲載されているプログラムは機能の確認程度の短いものがほとんどで、理解しやすく、手元にあると安心するが実践的とは言いにくい。そういったものを求める人は別な本の方が向いているかも。とはいえ、全くないわけではなく、最後の 2 章は今までの応用として実用的なプログラムを作ることになる。一つはデータベースライブラリで、もう一つはネットワークを使ったプリンタサーバ、クライアントプログラムを作る。これら 2 つの章ではコード片とその解説が交互に載っているのだが、紙の書籍を前提にしたレイアウトをとっており、一ベージ内にコードと解説が収まるようにしていることで、コードがかなりぶつ切りになっている。そのことが紙のサイズによる制約を受けない電子書籍ではかえって読みにくくなってしまっているのは残念。電子書籍だとかさばらないから、それだけでも大きなメリットだが。
+
+なお、この本には姉妹編とでもいうべき ``UNIX Network Programming'' というものもあって、こちらも恐ろしく厚い。ただ、最新の版が 2003 年と少し古い。未読のため、この本をゆるゆると読んでいる間に新版でも出てくれないかと思っていたが、その気配は感じられない。しかも電子書籍にもなっていない。あの厚さと重さはやはり読む前からくじけそうになるし、持ち運びもできないから電子書籍は非常に有難いのだが。古い紙の版を読むしかないのか。

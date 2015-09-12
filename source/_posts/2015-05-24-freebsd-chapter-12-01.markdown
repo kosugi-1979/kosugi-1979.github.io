@@ -1,0 +1,82 @@
+---
+layout: post
+title: "The Design and Implementation of the FreeBSD Operating System Second Edition Chapter 12.1"
+date: 2015-05-24 15:06:31 +0900
+comments: true
+categories: book freebsd
+---
+- Interprocess-Communication Model
+    - プロセス間通信のゴール
+        - ネットワークアクセス
+        - マルチプロセスのプログラムを作れるようにする
+    - プロセス間通信は以下をサポートするように設計されている
+        - 透過性
+            - 同一マシン上のプロセスであるか否に依存しない
+        - 効率
+            - 適用できるかは効率によって制限されることがあるため
+        - 互換性
+            - 変更なしで分散環境でも使えるべき
+    - プロセス間通信の設計時、以下の要求があった
+        - 異なる communication domain のサポート
+        - ファイルディスクリプタで操作可能なエンドポイントの抽象化
+            - socket はメッセージが送受信されるオブジェクト
+        - 通信のセマンティックな側面を統一的に利用可能にすること
+            - アプリケーションは異なるスタイルの通信を要求できなければならない
+                - stream とか datagram とか
+            - socket は通信のセマンティクスによって type 付けされる
+                - 配送順序
+                - 重復しない配送
+                - 信頼できる配送
+                - コネクション指向の通信
+                - メッセージ境界の保持
+                - out-of-band メッセージのサポート
+            - パイプは最初の 4 つをサポート
+            - out-of-band メッセージは通常の stream の外側で送信されるメッセージ
+            - コネクションはパケット毎に送る socket を識別する代わり、転送開始前に通信のエンドポイントを交換してそれを維持する機構
+            - コネクションレス通信は転送毎に source と destination アドレスを指定
+            - datagram socket はコネクションレスで信頼できないパケット通信を提供
+            - stream socket は信頼できるコネクション指向のバイトストリームを提供
+            - sequenced-packet socket は順序付き、信頼可能、重復なしでメッセージ境界を保持したコネクションベースの通信を提供
+    - プロセスは事前知識なしでランデブー可能な通信のエンドポイントを見付けられる必要がある
+        - socket に名前が付けられる
+            - socket が作られた communication domain のコンテキスト内でのみ有意
+                - アプリケーションが使う名前は可読性ありがほとんど
+                - socket に対しては低レベルなアドレスを使用
+                    - FreeBSD はユーザスペースで名前とアドレスの変換を行うライブラリを提供
+- Sockets の使用
+    - *socket* システムコールで socket を作成
+        - タイプ
+            - stream とか
+        - communication domain
+            - IPv4 とか
+        - プロトコル
+    - *socket* はファイルディスクリプタを返す
+    - socket 作成後はタイプに依存
+        - コネクション指向なら socket 間のコネクションの確立
+            - socket 間のコネクションはバインドされたアドレスを使用
+                - アドレスは socket address structure で表す
+                    - フォーマットは domain 間で異なる
+        - クライアントは *connect* システムコールでコネクションを始める
+        - サーバは socket 作成後、別な path でコネクションを作る
+            - アドレスをバインド
+            - クライアントから入ってくるコネクションを accept
+                - *listen* システムコールでクライアントからのコネクションにマークして
+                - *accept* でコネクション受信
+                    - *accept* はクライアントのアドレスとコネクトした socket を返す
+                        - この socket を通じて通信を行う
+                        - 元の socket はコネクションのリクエストの queue 管理用
+    - data の送受信には色々なシステムコールが使える
+        - 一番リッチなのは *sendmsg*/*recvmsg*
+            - scatter-gather
+            - 転送、受信時にアドレスを指定
+            - ancillary data や制御情報を扱える
+    - 送受信目的以外のシステムコールもある
+        - *getsockname* はローカルな socket のアドレスを取得
+        - *getpeername* はコネクションのリモート側エンドポイントのアドレスを取得
+        - *shutdown* socket の data 転送、受信を終了
+        - *setsockopt*/*getsockopt* socket やネットワークプロトコルのパラメータ設定、検索
+    - プロセス間通信のインタフェースは既存の *open*, *read*, *write* 等と直交するようにデザインされている
+        - 既存のインタフェースの複雑化を避ける
+        - ファイルシステムから独立したインタフェースを使うことで portability を向上
+        - 後方互換用に read-write インタフェースも意味がある場合には使える
+            - コネクト済みの stream socket 使用時とか

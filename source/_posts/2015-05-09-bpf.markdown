@@ -1,0 +1,499 @@
+---
+layout: post
+title: "Berkeley Packet Filter(BPF) を使う"
+date: 2015-05-09 05:09:58 +0900
+comments: true
+categories: freebsd network
+---
+
+Berkeley Packet Filter(BPF) は BSD 系の OS でデータリンク層へのアクセスを提供する仕組み。これを使うと Ethernet のフレーム等をユーザプログラムから操作できる。詳しくは bpf(4) を参照。
+
+## /dev/bpf のパーミッション ##
+
+BPF を使うにあたって、まず root 以外のユーザから /dev/bpf に対して read-write を許可しなくてはならない。tcpdump や wireshark のようなアプリケーションも /dev/bpf を使うので、それらを使ったことがある人は既に設定済みかもしれないが、/etc/devfs.conf に次のような記述を追加する。
+
+	own     /dev/bpf       root:network
+	perm    /dev/bpf       0660
+
+追加後に devfs を restart するとこの設定が有効になる。
+
+	% sudo devfs restart
+
+上記設定は /dev/bpf\* の owner が root で group が network、それに対するパーミッションは owner, group 共に read-write 可というもの。tcpdump や wireshark を使うだけなら write できる必要はないが、今回は write も使用するので、それも許可している。
+
+## パケットの read ##
+
+これで準備は整ったので早速 BPF を使ってみる。まずは一番簡単な read から。コード全体は gists に[アップしておいたので](https://gist.github.com/kosugi-1979/8b7fa5f734ee91461a17)、そちらを参照のこと。
+
+### BPF の open ###
+
+当然だけれど、まず最初に open から。
+
+``` c
+    return open("/dev/bpf", O_RDWR);
+```
+	
+これは普通に open するだけ。特段変わったことはない。以前は /dev/bpf[0-9] を使っていたので open できるものをループで探していたが、現在は /dev/bpf を open するだけで良い。
+
+### BPF のセットアップ ###
+
+続いて BPF をセットアップする。セットアップには ioctl を使い、どのような設定が可能かは bpf(4) の man で調べられる。
+
+最低限必要なのは interface のバインドで、先程 open した BPF に対してネットワークインタフェースを関連付けている。今回のプログラムではインタフェース名を引数として取り、それをバインドする。
+
+``` c
+    strlcpy(request.ifr_name, ifname, sizeof(request.ifr_name) - 1);
+    if (ioctl(fd, BIOCSETIF, &request) < 0) {
+        perror("BIOCSETIF failed: ");
+        return -1;
+    }
+```
+
+後の部分は必須ではないが、それぞれ次のようなことをしている。
+
+BIOCGDLT では 関連付けたインタフェースの datalink 層が DLT\_EN10MB、つまり Ethernet であるかを確認。
+
+``` c
+    if (ioctl(fd, BIOCGDLT, &type) < 0) {
+        perror("BIOCGDLT failed: ");
+        return -1;
+    }
+    if (type != DLT_EN10MB) {
+        printf("unsupported datalink type\n");
+        return -1;
+    }
+```
+
+BIOCSTSTAMP は BPF から返される timestamp の resolution を指定している。デフォルトでは BPF\_T\_MICROTIME が設定されており、timestamp は struct timeval で与えられるが、今回のように BPF\_T\_NANOTIME にすると struct timespec で与えられるようになる。
+
+``` c
+	tstamp = BPF_T_NANOTIME;
+    if (ioctl(fd, BIOCSTSTAMP, &tstamp) < 0) {
+        perror("BIOCSTSTAMP faild: ");
+        return -1;
+    }
+```
+	
+このようにした理由は bpf(4) man の
+
+>  Currently, bpf_hdr is used when the time stamp is set to BPF_T_MICROTIME, BPF_T_MICROTIME_FAST, BPF_T_MICROTIME_MONOTONIC, BPF_T_MICROTIME_MONOTONIC_FAST, or BPF_T_NONE for backward compatibility reasons.  Otherwise, bpf_xhdr is used.  However, bpf_hdr may be deprecated in the near future.
+
+という記述による。
+
+BIOCIMMEDIATE はパケット受信時、BPF 内のバッファが full になるまで block せずに、read がすぐ return するようにしている。性能を考えると当然バッファリングした方が良いが、今回のような動作確認目的のプログラムでは無用な混乱を招きかねないので off にした。
+
+
+``` c
+   enable = 1;
+    if (ioctl(fd, BIOCIMMEDIATE, &enable) < 0) {
+        perror("BIOCSIMMEDIATE failed: ");
+        return -1;
+	}
+```
+
+
+### read ###
+
+いよいよ本番。readPackets() に入る。
+
+read() の結果格納用の buf はサイズを BIOCGBLEN で取得した BPF のバッファサイズを基に確保する。
+
+``` c
+    if (ioctl(fd, BIOCGBLEN, &bufSize) < 0) {
+        perror("BIOCGBLEN failed: ");
+        return -1;
+    }
+
+	buf = malloc(bufSize);
+    if (buf == NULL) {
+        printf("memory alloation failed\n");
+        return -1;
+    }
+```
+
+ここに bpf から read する。
+
+``` c
+        if ((n = read(fd, buf, bufSize)) < 0) {
+            perror("read failure: ");
+            return -1;
+        }
+```
+
+read が成功したなら、buf にはバインドした interface から出て行くか、interface 宛のパケットが格納されている。各パケットの先頭には struct bpf\_xhdr が付いており、この定義は net/bpf.h にある。
+
+``` c net/bpf.h start:196
+struct bpf_xhdr {
+        struct bpf_ts   bh_tstamp;      /* time stamp */
+        bpf_u_int32     bh_caplen;      /* length of captured portion */
+        bpf_u_int32     bh_datalen;     /* original length of packet */
+        u_short         bh_hdrlen;      /* length of bpf header (this struct
+                                           plus alignment padding) */
+};
+```
+
+それぞれのメンバの役割はコメントに書かれている通り。bh\_caplen と bh\_datalen とがあるのは パケットが truncate され、実際にキャプチャできたサイズと本来のパケットサイズが異なるケースがあるため。
+
+この struct bpf\_xhdr の後にパケットが続く。パディングも含めた struct bpf\_xhdr のサイズは bh\_hdrlen なので、
+
+``` c
+				etherHeader = (struct ether_header*)(buf + bpfHeader->bh_hdrlen;
+```
+
+とすることで目的のパケットの先頭アドレスを得ることができる。今回は Ethernet のフレームを対象としているため、struct ether\_header\* にキャストしている。
+
+この Ethernet のフレームヘッダを print したら次のパケットに向かう。キャプチャしたパケットのサイズが bh\_caplen で struct bpf\_xhdr も合わせると、次のパケットの先頭位置は
+
+``` c
+			packet += BPF_WORDALIGN(bpfHeader->bh_hdrlen + bpfHeader->bh_caplen;
+```
+
+で得られる。正しい word align になるよう BPF\_WORDALIGN マクロを使うのを忘れないように。
+
+### 動作確認 ###
+
+実験用に以下のようなシンプルなネットワークの構成を用い、
+
+![arp packet](/images/2015-05-06-01.svg)
+
+jail\_02 側の epair1b で今回作成したプログラムを動かした上で jail\_01 から ping を打ったところ、以下のような結果が得られた。
+
+	% sudo jexec jail_02  root/bpf-read epair1b
+	Ether
+	src address: 02:00:f0:00:03:0a
+	dst address: ff:ff:ff:ff:ff:ff
+	ARP
+	sender hard: 02:00:f0:00:03:0a
+	sender proto: 10.0.0.1
+	target hard: 00:00:00:00:00:00
+	target proto: 10.0.0.2
+	
+	Ether
+	src address: 02:00:f0:00:04:0b
+	dst address: 02:00:f0:00:03:0a
+	ARP
+	sender hard: 02:00:f0:00:04:0b
+	sender proto: 10.0.0.2
+	target hard: 02:00:f0:00:03:0a
+	target proto: 10.0.0.1
+	
+	Ether
+	src address: 02:00:f0:00:03:0a
+	dst address: 02:00:f0:00:04:0b
+	IP
+	src: 10.0.0.1
+	dst: 10.0.0.2
+	
+	Ether
+	src address: 02:00:f0:00:04:0b
+	dst address: 02:00:f0:00:03:0a
+	IP
+	src: 10.0.0.2
+	dst: 10.0.0.1
+
+ARP の受送信後、IP パケットを受信していることが確認できる。
+
+## パケットのフィルタリング ##
+
+Berkeley Packet Filter という位なので、BPF にはフィルタリングの機能が備わっている。なので特定のアドレス向けの IP パケットのみをキャプチャするといったことも可能だ。
+
+詳細はやはり man に書いてあるのだが、BPF はフィルタリングのための filter machine を備えている。この filter machine に対するプログラムを記述することで意図したパケットのみを取得できるようになる。
+
+filter machine はパケットキャプチャ専用なので使用できる命令も限られているし、ループが作れないよう分岐も前方分岐のみとなっている。
+
+各命令の形式は
+
+``` c net/bpf.h start:1206
+struct bpf_insn {
+        u_short         code;
+        u_char          jt;
+        u_char          jf;
+        bpf_u_int32     k;
+};
+```
+
+で、code がオペコード、jt, jf は条件分岐命令における true, false 時の飛び先、k はオペコード毎に異なる用いられ方をする値。なお、命令毎に struct bpf\_insn の各メンバに対して直接値を設定するのは手間がかかるので、そのためのマクロが用意されている。BPF\_STMT は通常の命令用で BPF\_JUMP は分岐命令用。例として
+
+	BPF_STMT(BPF_LD+BPF_H+BPF_ABS, 12)
+
+とすれば halfword の絶対値(ここでは 12)を accumulator にロードする命令を作れる。また、
+
+	BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, ETHERTYPE_REVARP, 0, 3)
+
+とすれば accumlator と k(ここでは ETHERTYPE_REVARP) が等しい時に 0 命令先、等しくなければ 3 命令先に飛ぶ命令を作れる。
+
+このようにして作成した命令の配列を struct bpf\_program に入れて ioctl に BIOCSETF で設定すればフィルタが使えるようになる。
+
+``` c net/bpf.h start:65
+struct bpf_program {
+        u_int bf_len;
+        struct bpf_insn *bf_insns;
+};
+```
+
+最終的に BPF\_RET 命令で返したものが read で読める。他に filter machine がどのような命令を持っているかは bpf(4) の man を参照。
+
+### 実際のプログラム ###
+
+では、実際にフィルタプログラムを使ってみる。フィルタリング処理以外は read と同じなので、ここではフィルタに関してのみを記述する。最終的なコードはやはり [Gists](https://gist.github.com/kosugi-1979/bae7e970df40d1f0fea3) に置いた。
+
+最も簡単なのは全てフィルタして何も通さないもの。
+
+``` c
+int
+setFilter(int fd)
+{
+	struct bpf_program prog;
+	struct bpf_insn insns[] = {
+		BPF_STMT(BPF_RET+BPF_K, 0)
+	};
+
+	prog.bf_len = sizeof(insns) / sizeof(insns[0]);
+	prog.bf_insns = insns;
+
+	if (ioctl(fd, BIOCSETF, &prog) < 0) {
+		return -1;
+	}
+	return 0;
+}
+```
+
+bpf のファイルディスクリプタを fd として setFilter() を呼べばこのフィルタが適用される。
+
+これを使うと、read で block したままになる。なお、BPF\_STMT の 0 を適当な正数にすると 各パケットの先頭から struct bpf\_xhdr のサイズ + 指定した byte 数だけが得られる。
+
+これだけだと何もうれしくないので、もう少し複雑なプログラムとして ARP パケットのみをキャプチャするものを作る。
+
+``` c
+int
+setFilter(int fd)
+{
+	struct bpf_program prog;
+	struct bpf_insn insns[] = {
+		BPF_STMT(BPF_LD+BPF_H+BPF_ABS, 12),
+		BPF_JUMP(BPF_JMP+BPF_JEQ+BPF_K, ETHERTYPE_ARP, 0, 1),
+		BPF_STMT(BPF_RET+BPF_K, (u_int)-1),
+		BPF_STMT(BPF_RET+BPF_K, 0)
+	};
+
+	prog.bf_len = sizeof(insns) / sizeof(insns[0]);
+	prog.bf_insns = insns;
+
+	if (ioctl(fd, BIOCSETF, &prog) < 0) {
+		return -1;
+	}
+	return 0;
+}
+```
+
+パケットが ARP であるかを知るには Ethernet フレームのタイプを調べ、それが ETHERTYPE\_ARP であるかを見れば良い。タイプの情報は 6bytes の destination address と source address の次にあるので、
+{% codeblock lang:c %}
+BPF_STMT(BPF_LD+BPF_H+BPF_ABS, 12)
+{% endcodeblock %}
+で該当個所を load してから続く JUMP 命令で ETHERTYPE\_ARP と比較している。
+
+JUMP 命令の飛び先である 2 つ並んだ BPF\_RET は最初が ARP パケットを返すためのもので、次がそれ以外のパケットを破棄するためのものになっている。その違いはパラメータの -1 と 0 になって表れており、前者は (u\_int)-1 なので最大長、つまりはパケット全体を返し、後者は先程の例と同じく完全にフィルタしている。
+
+man にはより複雑な例が載っているので、詳しく知りたければそちらを参照。
+
+### 動作確認 ###
+
+プログラムの動作を確認するには ARP パケットを送信、もしくは受信する必要がある。read 時の実行結果から考えると、ping でも打ってやれば良く思えるが、あれはたまたま ARP パケットのやりとりがあっただけで、常にそれでうまく行くとは限らない。というのも、毎回 ARP パケットをやりとりしていると非常に効率が悪いため、OS の側で ARP の結果をアドレス変換テーブルにキャッシュしているからだ。このキャッシュの有効期限が切れるまで ARP パケットは送信されない。FreeBSD ではこの有効期限がデフォルトで 20 分に設定されている。有効期限は sysctl で変更可能。
+
+なお、
+
+	% arp -a
+
+で現在のアドレス変換テーブルの内容を見ることができる。
+
+これから ping を打とうとしている host がこの出力結果に含まれていれば、ARP パケットは送信されない。そこで、
+
+	% sudo arp -d -a
+
+とするとテーブルの全エントリが削除される。-a オブションの代わりに hostname を指定することで特定のエントリのみを削除することも可能。
+
+このようにしてテーブルに ping の送信先が存在しないことを確めてから ping を打つ。read の場合と同じ構成のネットワークで jail\_01 から jail_02 へ ping を打った結果、以下のようになった。
+
+	% sudo jexec jail_02  root/bpf-filter epair1b
+	Ether
+	src address: 02:00:f0:00:03:0a
+	dst address: ff:ff:ff:ff:ff:ff
+	ARP
+	sender hard: 02:00:f0:00:03:0a
+	sender proto: 10.0.0.1
+	target hard: 00:00:00:00:00:00
+	target proto: 10.0.0.2
+	
+	Ether
+	src address: 02:00:f0:00:04:0b
+	dst address: 02:00:f0:00:03:0a
+	ARP
+	sender hard: 02:00:f0:00:04:0b
+	sender proto: 10.0.0.2
+	target hard: 02:00:f0:00:03:0a
+	target proto: 10.0.0.1
+
+read の例と大して変わらないが、こちらでは ARP の後に続く IP パケットがなくなっている。
+
+## パケットの write ##
+
+read を使った受信はできたので、今度は write を使った送信を試す。関心のある部分だけ知っていれば良い read の場合と違い、write は送信するパケットを構築するための情報全てを知っておかなければならない。
+
+ここでは read 同様 ARP のパケットを扱う。これもコードは [Gists](https://gist.github.com/kosugi-1979/956b5383e1a77ebf20b7) に置いておく。
+
+### ARP パケットの構造 ###
+
+これはネット上に大量に情報が転がっているので、いちいちここで書かずに参照だけ示せば良いとは思うが、必要最低限な部分だけは説明しておく。ARP(Address Resolution Protocol) は protocol address から hardware address を知るためのプロトコルで、今回の場合 protocol address が IP address に、hardware address が MAC address に相当する。これ以外の address を用いることも可能で、その時には address 長も異なり、結果としてパケットサイズも変わる。
+
+protocol address を IP address、hardware address を MAC address とした時の ARP パケットは下図のようになる。
+
+![arp packet](/images/arp-packet.svg)
+
+これに Ethernet へッダを付けて送信する。destination address にはブロードキャストアドレス(ff:ff:ff:ff:ff)を指定する。
+
+### Ethernet フレームの構造 ###
+
+![arp packet](/images/ether-frame.svg)
+
+このうち、preamble と SDF は物理層に当たり、データリンク層から気にする必要はない。FCS もチェクサムで BPF を使う分には無視で。る。よって、BPF に write する際には destination MAC address から payload までになる。上述したように、ARP request の場合、destination MAC address はブロードキャストアドレス(ff:ff:ff:ff:ff)をいれる。
+
+payload が実際に送りたい情報で、今回はここに ARP パケットを格納して送信する。
+
+### 実際のプログラム ###
+
+
+
+以上の情報を基に ARP のパケットを作成する。そのために sender hardware address と sender protocol address を知る必要がある。FreeBSD では getifaddrs(3) を使うことで両方を取得できる。
+
+``` c
+int
+getAddress(const char* restrict ifname,
+        u_char* restrict hardwareAddress, in_addr_t* restrict protocolAddress)
+{
+    struct ifaddrs *addrList, *addr;
+    struct sockaddr_dl *dlAddr = NULL;
+    struct sockaddr_in *srcAddr = NULL;
+    int ret = 0;
+
+    if (getifaddrs(&addrList) < 0) {
+        return -1;
+    }
+    addr = addrList;
+    while (addr && (!dlAddr || !srcAddr)) {
+        if (addr->ifa_addr->sa_family == AF_LINK) {
+            if (strcmp(ifname, addr->ifa_name) == 0) {
+                dlAddr = (struct sockaddr_dl*)addr->ifa_addr;
+            }
+        }
+        else if (addr->ifa_addr->sa_family == AF_INET) {
+            if (strcmp(ifname, addr->ifa_name) == 0) {
+                srcAddr = (struct sockaddr_in*)addr->ifa_addr;
+            }
+        }
+        addr = addr->ifa_next;
+    }
+
+    if (dlAddr && srcAddr) {
+        memcpy(hardwareAddress, LLADDR(dlAddr), dlAddr->sdl_alen);
+        memcpy(protocolAddress, &srcAddr->sin_addr, sizeof(in_addr_t));
+    } else {
+        printf("cannot find link layer address for %s", ifname);
+        ret = -1;
+    }
+
+    freeifaddrs(addrList);
+
+    return ret;
+}
+```
+
+getifaddrs は struct ifaddrs のリストを返す。このリストをたどりながら送信に使用するインタフェースに対応する sender hardware address と sender protocol address を見付ける。
+
+なお、getifaddrs は内部でメモリを確保するため、不用になったら freeifaddrs(3) でメモリを解放するのを忘れずに。
+
+このようにして取得したアドレスを基に Ethernet のヘッダと ARP パケットを作成する。まずは Ethernet のヘッダ から。
+
+``` c
+void
+makeEther(struct ether_header* ether)
+{
+    static const u_char etherBroadcast[ETHER_ADDR_LEN] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+    };
+
+    memcpy(&ether->ether_shost, src, ETHER_ADDR_LEN);
+    memcpy(&ether->ether_dhost, etherBroadcast, ETHER_ADDR_LEN);
+    ether->ether_type = htons(ETHERTYPE_ARP);
+}
+```
+
+これといって難しいところはない。ether\_shost にアドレスではなく 0 を入れているのは default で header complete フラグが有効になっていることで、自動的に正しい値を入れてくれるから。今回は ARP のために source のハードウェアアドレスを取得しなければならなかったため、それを明示的に使用したければ *ioctl* の BIOCSHDRCMPLT で 0 以外の値を設定する。
+
+続いて ARP パケットを作成する。
+
+``` c
+void
+makeArp(const u_char* restrict srcHardwareAddress,
+        const in_addr_t* srcProtocolAddress,
+        const in_addr_t* dstProtocolAddress,
+        struct arphdr* restrict arp)
+{
+    arp->ar_hrd = htons(ARPHRD_ETHER);
+    arp->ar_pro = htons(ETHERTYPE_IP);
+    arp->ar_hln = ETHER_ADDR_LEN;
+    arp->ar_pln = sizeof(in_addr_t);
+    arp->ar_op = htons(ARPOP_REQUEST);
+    memcpy(ar_sha(arp), srcHardwareAddress, ETHER_ADDR_LEN);
+    memcpy(ar_spa(arp), srcProtocolAddress, sizeof(in_addr_t));
+    memset(ar_tha(arp), 0, ETHER_ADDR_LEN);
+    memcpy(ar_tpa(arp), dstProtocolAddress, sizeof(in_addr_t));
+}
+```
+
+これも素直に前掲の ARP パケットの構造に合わせて値を入れているだけ。この ARP で調べようとしている target の hardware address は 0 にしておく。
+
+これで送信の準備が整った。送信は単に write するだけ。今回は Ethernet のヘッダと ARP パケットを別々に作ったので、*writev* を使った。
+
+``` c
+        struct iovec  writeVec[2];
+
+        writeVec[0].iov_base = &ether;
+        writeVec[0].iov_len = sizeof(ether);
+        writeVec[1].iov_base = arp;
+        writeVec[1].iov_len = sizeof(arp);
+        writev(fdBpf, writeVec, 2);
+```
+
+ちなみに、BPF では write に対してもフィルタリングが可能で、その時は *ioctl* で BIOCSETF の代わりに BIOCSETWF を使う。
+
+### 動作確認 ###
+
+ここでも同じ構成のネットワークを用いて BPF への write を試す。とはいっても、このプログラムは何も出力しないので、先程の bpf-filter で ARP パケットの送受信を確認する。
+
+	%sudo jexec jail_01  root/bpf-read epair1a
+
+このように先に bpf-read を起動した上で、
+
+	% sudo jexec jail_01 /root/bpf-write epair1a 10.0.0.2
+
+とした時に以下の出力が得られた。
+
+	Ether
+	src address: 02:00:f0:00:03:0a
+	dst address: ff:ff:ff:ff:ff:ff
+	ARP
+	sender hard: 02:00:f0:00:03:0a
+	sender proto: 10.0.0.1
+	target hard: 00:00:00:00:00:00
+	target proto: 10.0.0.2
+
+	Ether
+	src address: 02:00:f0:00:04:0b
+	dst address: 02:00:f0:00:03:0a
+	ARP
+	sender hard: 02:00:f0:00:04:0b
+	sender proto: 10.0.0.2
+	target hard: 02:00:f0:00:03:0a
+	target proto: 10.0.0.1
+
+最初のパケットが jail\_01 から送信したもので、次が jail\_02 からの応答にあたる。

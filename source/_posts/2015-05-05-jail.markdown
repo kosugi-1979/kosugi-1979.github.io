@@ -1,0 +1,194 @@
+---
+layout: post
+title: "Jail のセットアップ"
+date: 2015-05-05 13:21:21 +0900
+comments: true
+categories: freebsd jail virtualization
+---
+
+	% uname -a
+	FreeBSD freebsd11 11.0-CURRENT FreeBSD 11.0-CURRENT #5 r282360: Mon May  4 07:47:43 JST 2015     root@freebsd11:/usr/obj/usr/src/sys/GENERIC  amd64
+
+こういった内容の記事は [FreeBSD Handbook](https://www.freebsd.org/doc/handbook/jails.html) をはじめとして星の数程あるので、今さら文章にして残しておく必要などないのかもしれないが、備忘のために書いておく。
+
+なお、jail では jailer と prisoner という用語が良く使われるようだが、FreeBSD Handbook の [Terms Related to Jails](https://www.freebsd.org/doc/handbook/jails-terms.html) にそのような言葉はないのでここでも使わない。
+
+## 作成する jail 環境 ##
+
+* 複数の jail インスタンス間で共有できるものはなるべく共有する。つまり、セキュリティ目的でインスタンス毎にユーザランドを分離したりはしない。
+* write 可能な場所は少なめに。
+* ports からのアプリケーションのインストールを可能にする。
+* devfs の mem, kmem, bpf を使用できるようにする。
+* jail の起動は host 起動後にコマンドラインから手で行う。
+* 各 jail インスタンスの hostname は ``jail_??'' (?? は十進数字)とする。
+
+## ユーザランドのインストール ##
+
+host となるシステムと分離したいのであれば、host とは別の場所にユーザランドをインストールする。今回は /home/jail/base をインストール先とした。当然、事前に buildworld しておくこと。
+
+	# cd /usr/src
+	# make -j 4 buildworld
+	# mkdir -p /home/jail/base
+	# make installworld DESTDIR=/home/jail/base
+
+続いてコンフィグファイル類もインストール。
+
+	# make distribution DESTDIR=/home/jail/base
+
+これで jail を動かすのに最低限の環境が整った。ということで早速動かしてみる。
+
+	# jail -c path=/home/jail/base command=/bin/sh
+	#
+
+二行目のプロンプトの時点で jail 環境の内側にいるので、別のターミナルから確認する。
+
+	% jls
+	   JID  IP Address      Hostname                      Path
+	     1  -                                             /usr/home/jail/base
+
+jail が動いているのがわかる。この状態で jail 内から exit して sh を終わらせると合わせて jail も終了する。もしプロセスがない状態でも jail を動かし続けたければ ``persist'' パラメータを用いる。
+
+	# jail -c path=/home/jail/base persist
+
+これを終わらせるには jail 内のプロセスがない状態で nopersist にしてやれば良い。上記の例は Hostname がないので JID(ここでは 1 だとする) を用いて
+
+	# jail -m jid=1 nopersist
+
+とする。これで jail の起動、起了を確認できた。
+
+続いて jail の環境を作っていく。複数の jail インスタンスを用いるにあたって、全ての path が /home/jail/base では何かと都合が悪い。そのため各インスタンスに対して path が /home/jail/${name} となるようにする(${name} はその jail の hostname で、``jail_01'' とか)。
+
+全ての /home/jail/${name} にユーザランドのコピーを置くのは容量面でもメンテナンス面でも現実的ではないので、nullfs を用いる。 
+nullfs に関しては mount_nullfs(8) に詳しいが、ファイルシステム内の一部分を別の場所に複製するためのもので、同一のファイルやディレクトリを別の pathname でアクセス可能にする。シンポリックリンクとの違いは gwcwd() の結果を正しく得ることができる点や異なるファイルシステムをマウントできる点。
+
+全 jail 間で共有するのは bin, etc, home, lib, libexec, root, sbin, var くらい。home は目的によっては共有しない方が良いかも。書き換えが発生しないディレクトリは read only の方が安心できるので、マウント時に ``ro'' をオプションとして渡す。また、tmp や後述する devfs, ports tree のマウントポイントも作っておく。
+
+	# for i in 01 02
+	do
+		mkdir -p /home/jail/jail_${i}
+		mkdir -p /home/jail/jail_${i}/usr/ports
+		mkdir -p /home/jail/jail_${i}/dev
+		mkdir -p /home/jail/jail_${i}/tmp
+		for d in bin lib libexec sbin
+		do
+			mkdir -p /home/jail/jail_${i}/${d}
+			mount -t nullfs -o ro /home/jail/base/${d} /home/jail/jail_${i}/${d}
+		done
+		for d in etc home var root usr
+		do
+			mkdir -p /home/jail/jail_${i}/${d}
+			mount -t nullfs /home/jail/base/${d} /home/jail/jail_${i}/${d}
+		done			
+	done
+
+## devfs のマウント ##
+
+devfs は
+
+	# mount -t devfs -o ruleset=4 devfs /home/jail/net/dev 
+
+でマウントできる。ruleset は /etc/defaults/devfs.rules に jail 用に最低限のものだけを unhide するものが用意されているのでそれを利用した。ただ、これでは今回の目的である mem,kmem,bpf が hide されてしまうので、これをベースに独自の ruleset を作成する。
+
+	# vim /etc/devfs.rules
+
+中身はこんな感じ。
+
+	[devfsrules_jailnet=1000]
+	add include $devfsrules_hide_all
+	add include $devfsrules_unhide_basic
+	add include $devfsrules_unhide_login
+	add path zfs unhide
+	add path mem unhide
+	add path kmem unhide
+	add path 'bpf*' unhide
+
+個人的には devfsrules_jail を include したかったのだけれど、どうもネストした include はできないらしい。この辺のことは man にも書かれていないのではっきりしたことは言えない。
+マウントしなおして確認。その際 devfs をリスタートして devfs.rules を再読み込みさせておくこと。
+
+	# umount /home/jail/net/dev
+	# service devfs restart
+	# mount -t devfs -o ruleset=1000 devfs /home/jail/net/dev 
+
+## ports 環境の整備 ##
+
+ports tree は host と jail とで同じものを使用する。そのために nullfs で ports tree
+をマウントする。
+
+	# mount -t nullfs -o ro /usr/ports /home/jail/base/usr/ports
+
+このままだと distfiles が read only になってしまうため、そこだけは別に用意する。
+
+	# mkdir -p /home/jail/rw/distfiles
+	# mount -t nullfs /home/jail/rw/distfiles /home/jail/net/usr/ports/distfiles
+
+本来なら /usr/ports/distfiles を使いたいのだが、それだと
+
+	mount_nullfs: /usr/home/jail/base/usr/ports/distfiles: Resource deadlock avoided
+
+というふうに resource deadlock を回避するために mount が失敗してしまうので、ここでは別にディレクトリを作成した。多少無駄はでるが、jail 環境内で多くの ports をインストールすることはないのでそこまでは問題にならないはず。
+
+これだけではまだ不十分で、/home/jail/base/etc/make.conf でビルド用のディレクトリを指定してやる。
+
+	WRKDIRPREFIX?=  /var/portbuild
+
+最後に resolv.conf に nameserver を記述する。とはいっても jail 環境にはまだ IP address を割り当てていないのでファイルのダウンロードができない。jail コマンドから ip4.addr パラメータ経由で IP address を与えることもできるが、今回は jail.conf で設定する。それまでは ports を使ってアプリケーションをインストールできない。
+
+## jail.conf の作成 ##
+
+今までやってきたことの多くは jail.conf に記述して、サービスの起動時に自動で設定することができる。古めの jail の解説では rc.conf で jail 関連の設定をするようにしているが、最近は /etc/jail.conf に書くようになっている。man で jail(8) と jail.conf(5) を見れば大体分かるはず。
+
+	exec.start = "/bin/sh /etc/rc";
+	exec.stop = "/bin/sh /etc/rc.shutdown";
+	exec.clean;
+	mount  = "/home/jail/base/bin /home/jail/${name}/bin nullfs ro 0 0";
+	mount += "/home/jail/base/lib /home/jail/${name}/lib nullfs ro 0 0";
+	mount += "/home/jail/base/libexec /home/jail/${name}/libexec nullfs ro 0 0";
+	mount += "/home/jail/base/sbin /home/jail/${name}/sbin nullfs ro 0 0";
+	mount += "/home/jail/base/etc /home/jail/${name}/etc nullfs rw 0 0";
+	mount += "/home/jail/base/home /home/jail/${name}/home nullfs rw 0 0";
+	mount += "/home/jail/base/usr /home/jail/${name}/usr nullfs rw 0 0";
+	mount += "/home/jail/base/root /home/jail/${name}/root nullfs rw 0 0";
+	mount += "/home/jail/base/var /home/jail/${name}/var nullfs rw 0 0";
+	mount += "/usr/ports /home/jail/${name}/usr/ports nullfs ro 0 0";
+	mount += "/home/jail/rw/distfiles /home/jail/${name}/usr/ports/distfiles nullfs rw 0 0";
+	mount.devfs;
+	devfs_ruleset="1000";
+	allow.raw_sockets;
+
+	path = "/home/jail/${name}";
+	host.hostname = "$name";
+	interface = "vtnet0";
+	
+	jail_01 {
+        ip4.addr = 192.168.1.134/24;
+	}
+
+	jail_02 {
+        ip4.addr = 192.168.1.135/24;
+	}
+
+最初のものは共通の設定で、jail\_01 と jail\_02 が各 jail インスタンス毎の設定になっている。ここで初めて触れるものは以下の通り。
+
+* allow.raw\_sockets: ping を送れるように raw socket を許可している。
+* host.hostname: jail の hostname
+* interface: IP address を割り当てる対象となる interface 名
+* ip4.addr: interface に割り当てられる IP address のリスト
+
+## rc.conf の設定 ##
+
+作成した jail.conf を使って jail を起動するには rc.conf に以下の記述を追加する。
+
+	jail_enable="NO"
+	jail_list="jail_01 jail_02"
+
+jail\_enable は "YES" なら host 起動時に jail も起動する。"NO" にしたら
+
+	# service jail onestart
+
+のように明示的に起動する必要がある。終わらせる時は ``onestop''。jail\_list は jail.conf 内で ${name} として参照される名前をスペースで区切ったリスト。
+
+jail 起動後にその jail でコマンド(例:ls)を動かしたければ
+
+	% sudo jexec jail_01 ls
+
+のようにする。ls ではなく、tcsh などにすると jail 環境内に root でログインできる。もちろん jail 内向けにユーザアカウントを作ってそれでコマンドを実行することも可能だが、今回は行わない。
